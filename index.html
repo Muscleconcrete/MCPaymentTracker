@@ -279,7 +279,7 @@ const emptyFin = () => ({
 /* ---- migrate data from earlier versions ---- */
 function migJob(j) {
   if (Array.isArray(j.payments)) {
-    const base = { flagNote: "", dealerDeposit: 0, financed: false, pourPending: false, scheduled: true, fin: emptyFin(), ...j, fin: j.fin ? j.fin : emptyFin() };
+    const base = { flagNote: "", dealerDeposit: 0, financed: false, pourPending: false, scheduled: true, invoiceNo: "", fin: emptyFin(), ...j, fin: j.fin ? j.fin : emptyFin() };
     if (!base.type) base.type = base.financed ? "financed" : (base.dealerDeposit > 0 ? "dealer" : "inhouse");
     base.financed = base.type === "financed";
     return base;
@@ -301,7 +301,7 @@ function migJob(j) {
   });
   if (j.deposit > 0) payments.unshift({ id: uid(), amount: j.deposit, date: j.createdAt || today(), note: "Deposit" });
   return { id: j.id, customer: j.customer, note: j.note || "", flagNote: "", dealerDeposit: 0,
-    type: "inhouse", financed: false, pourPending: false, scheduled: true, fin: emptyFin(), total: j.total, extras, payments, createdAt: j.createdAt || today() };
+    type: "inhouse", financed: false, pourPending: false, scheduled: true, invoiceNo: "", fin: emptyFin(), total: j.total, extras, payments, createdAt: j.createdAt || today() };
 }
 
 /* ---- period ---- */
@@ -348,7 +348,7 @@ let saveError = false;
 let expanded = {};
 let bigImg = {};   // imgId -> enlarged?
 let imgCache = {}; // imgId -> dataURL
-let form = { customer: "", total: "", dealerDeposit: "", inhouseDeposit: "", note: "", type: "inhouse", notScheduled: false };
+let form = { customer: "", total: "", dealerDeposit: "", inhouseDeposit: "", note: "", invoiceNo: "", type: "inhouse", notScheduled: false };
 let payDrafts = {};
 let editingPay = {};   // paymentId -> true while its row is in edit mode
 let extraDrafts = {};
@@ -414,6 +414,7 @@ const A = {
     const job = {
       id: uid(), customer: form.customer.trim(), note: form.note.trim(), flagNote: "",
       total: r2(num(form.total)),
+      invoiceNo: form.invoiceNo.trim(),
       dealerDeposit: r2(Math.max(0, num(form.dealerDeposit))),
       type, financed: type === "financed", fin: emptyFin(),
       pourPending: false, scheduled: !form.notScheduled,
@@ -423,7 +424,7 @@ const A = {
       job.payments.push({ id: uid(), amount: r2(num(form.inhouseDeposit)), date: today(), note: "Deposit" });
     }
     jobs.unshift(job);
-    form = { customer: "", total: "", dealerDeposit: "", inhouseDeposit: "", note: "", type: "inhouse", notScheduled: false };
+    form = { customer: "", total: "", dealerDeposit: "", inhouseDeposit: "", note: "", invoiceNo: "", type: "inhouse", notScheduled: false };
     showForm = false;
     persist();
   },
@@ -438,6 +439,14 @@ const A = {
     const j = jobs.find(x => x.id === jobId);
     if (!j) return;
     j.pourPending = !j.pourPending;
+    persist();
+  },
+  setInvoiceNo(jobId) {
+    const j = jobs.find(x => x.id === jobId);
+    if (!j) return;
+    const v = prompt("Invoice # for " + j.customer + ":", j.invoiceNo || "");
+    if (v === null) return;
+    j.invoiceNo = v.trim();
     persist();
   },
   toggleSched(jobId) {
@@ -775,6 +784,14 @@ function jobCardHTML(job, rng) {
     if (job.financed) {
       const invBase = r2((job.total - dd) / 2);
       body += `<div class="secthead eyebrow">Financing — invoices <span style="color:#6E6E6E;text-transform:none;letter-spacing:0">(50/50 split${dd > 0 ? " of balance after dealer deposit" : ""} · each invoice = <span class="mono">${fmt(invBase)}</span>)</span></div>`;
+      body += `<div class="finrow" style="align-items:center">
+        <div style="flex:1 1 140px;min-width:120px">
+          <div style="font-size:14px;font-weight:600">Invoice #</div>
+          <div class="hint">Assigned by the lender</div>
+        </div>
+        <div class="mono" style="font-size:16px;font-weight:700;color:${job.invoiceNo ? "#A8C7F0" : "#6E6E6E"}">${job.invoiceNo ? esc(job.invoiceNo) : "— not set —"}</div>
+        <button class="btn-ghost" onclick="A.setInvoiceNo('${job.id}')">${job.invoiceNo ? "Edit" : "Add invoice #"}</button>
+      </div>`;
       body += finLegHTML(job, "first", "1st invoice — 50%", "Mark received the day the check is deposited on site.");
       body += finLegHTML(job, "final", "Completion invoice", "Typically ~2 weeks after the customer approves and releases funds.");
     }
@@ -848,6 +865,7 @@ function jobCardHTML(job, rng) {
     <div class="cardhead" onclick="A.toggle('${job.id}')">
       <div style="flex:1 1 160px;min-width:140px">
         <div style="font-weight:700;font-size:16px;color:${done ? "#7A7A7A" : "#E9E9E9"}">${esc(job.customer)}
+          ${job.invoiceNo ? `<span class="badge mono" style="color:#A8C7F0;background:#1D2A3F">INV #${esc(job.invoiceNo)}</span>` : ""}
           ${done ? '<span class="badge full">PAID IN FULL</span>' : ""}${finChip}
           ${job.scheduled === false && !done ? '<span class="badge fin">📋 NOT SCHEDULED</span>' : ""}
           ${job.pourPending && !done ? '<span class="badge wait">⏳ POUR PENDING</span>' : ""}
@@ -880,7 +898,7 @@ function renderList() {
   if (rng) list = list.filter(j => inRange(j.createdAt, rng) || j.payments.some(p => inRange(p.date, rng)));
   if (search.trim()) {
     const q = search.trim().toLowerCase();
-    list = list.filter(j => j.customer.toLowerCase().includes(q) || (j.note || "").toLowerCase().includes(q) || (j.flagNote || "").toLowerCase().includes(q));
+    list = list.filter(j => j.customer.toLowerCase().includes(q) || (j.note || "").toLowerCase().includes(q) || (j.flagNote || "").toLowerCase().includes(q) || (j.invoiceNo || "").toLowerCase().includes(q));
   }
   el.innerHTML = list.length
     ? list.map(j => jobCardHTML(j, rng)).join("")
@@ -994,6 +1012,12 @@ function render() {
           oninput="A.formSet('inhouseDeposit',this.value)">
         <div class="hint">Goes straight into their payment log as "Deposit" — counts as money we collected.</div>
       </div>` : ""}
+      ${form.type === "financed" ? `
+      <div style="margin-top:12px;max-width:280px">
+        <label>Invoice # (assigned by the lender)</label>
+        <input class="in mono" placeholder="e.g. 48231" value="${esc(form.invoiceNo)}"
+          oninput="A.formSet('invoiceNo',this.value)">
+      </div>` : ""}
       <label style="display:flex;align-items:center;gap:8px;margin-top:12px;font-size:14px;color:#E9E9E9;cursor:pointer">
         <input type="checkbox" ${form.notScheduled ? "checked" : ""} onchange="A.formSched(this.checked)" style="width:16px;height:16px;accent-color:#F5B01C">
         Not on the schedule yet${form.type === "financed" ? " — waiting on first check" : ""}
@@ -1039,7 +1063,7 @@ function render() {
       <button class="tab ${view === "done" ? "on" : ""}" onclick="A.setView('done')">Fully paid (${doneCount})</button>
       <button class="tab ${view === "flagged" ? "on" : ""}" onclick="A.setView('flagged')">⚑ Flagged (${flaggedCount})</button>
       <button class="tab ${view === "all" ? "on" : ""}" onclick="A.setView('all')">All</button>
-      <input class="in" style="width:auto;flex:1 1 160px;min-width:140px" placeholder="Search customers…" value="${esc(search)}"
+      <input class="in" style="width:auto;flex:1 1 160px;min-width:140px" placeholder="Search name, invoice #, notes…" value="${esc(search)}"
         oninput="A.setSearch(this.value)">
     </div>
     <div id="list"></div>
