@@ -272,14 +272,26 @@ const paidOf = j => r2(j.payments.reduce((s, p) => s + p.amount, 0));
 const balanceOf = j => r2(chargesOf(j) - paidOf(j));
 const jobDone = j => balanceOf(j) <= 0.005;
 const emptyFin = () => ({
-  first: { invoiced: "", received: "", imgId: "", paymentId: "" },
-  final: { invoiced: "", received: "", imgId: "", paymentId: "" }
+  first: { invoiced: "", received: "", deposited: "", imgId: "", paymentId: "" },
+  final: { invoiced: "", received: "", deposited: "", imgId: "", paymentId: "" }
 });
+/* a check that's been received but not yet deposited (job not on site yet) */
+const heldOn = j => {
+  if (!j.financed) return 0;
+  let s = 0;
+  const half = r2((j.total - (j.dealerDeposit || 0)) / 2);
+  for (const leg of ["first", "final"]) {
+    const f = j.fin[leg];
+    if (f.received && !f.deposited) s += half;
+  }
+  return r2(s);
+};
 
 /* ---- migrate data from earlier versions ---- */
 function migJob(j) {
   if (Array.isArray(j.payments)) {
-    const base = { flagNote: "", dealerDeposit: 0, financed: false, pourPending: false, scheduled: true, invoiceNo: "", fin: emptyFin(), ...j, fin: j.fin ? j.fin : emptyFin() };
+    const base = { flagNote: "", dealerDeposit: 0, financed: false, pourPending: false, scheduled: true, invoiceNo: "", schedDate: "", fin: emptyFin(), ...j, fin: j.fin ? j.fin : emptyFin() };
+    for (const leg of ["first", "final"]) if (base.fin[leg] && base.fin[leg].deposited === undefined) base.fin[leg].deposited = "";
     if (!base.type) base.type = base.financed ? "financed" : (base.dealerDeposit > 0 ? "dealer" : "inhouse");
     base.financed = base.type === "financed";
     return base;
@@ -301,7 +313,7 @@ function migJob(j) {
   });
   if (j.deposit > 0) payments.unshift({ id: uid(), amount: j.deposit, date: j.createdAt || today(), note: "Deposit" });
   return { id: j.id, customer: j.customer, note: j.note || "", flagNote: "", dealerDeposit: 0,
-    type: "inhouse", financed: false, pourPending: false, scheduled: true, invoiceNo: "", fin: emptyFin(), total: j.total, extras, payments, createdAt: j.createdAt || today() };
+    type: "inhouse", financed: false, pourPending: false, scheduled: true, invoiceNo: "", schedDate: "", fin: emptyFin(), total: j.total, extras, payments, createdAt: j.createdAt || today() };
 }
 
 /* ---- period ---- */
@@ -338,17 +350,26 @@ function periodRange() {
   return { start: iso(start), end: iso(end), label };
 }
 const inRange = (dateStr, rng) => dateStr >= rng.start && dateStr < rng.end;
+function weekRange(off) {
+  const s = new Date();
+  s.setDate(s.getDate() - s.getDay() + (off || 0) * 7);
+  const e = new Date(s); e.setDate(e.getDate() + 7);
+  const eShow = new Date(s); eShow.setDate(eShow.getDate() + 6);
+  const f = d => d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+  return { start: iso(s), end: iso(e), label: f(s) + " – " + f(eShow) };
+}
 
 /* ---- state ---- */
 let jobs = [];
-let view = "active";
+let view = "week";
+let weekOff = 0;
 let search = "";
 let showForm = false;
 let saveError = false;
 let expanded = {};
 let bigImg = {};   // imgId -> enlarged?
 let imgCache = {}; // imgId -> dataURL
-let form = { customer: "", total: "", dealerDeposit: "", inhouseDeposit: "", note: "", invoiceNo: "", type: "inhouse", notScheduled: false };
+let form = { customer: "", total: "", dealerDeposit: "", inhouseDeposit: "", note: "", invoiceNo: "", schedDate: "", type: "inhouse", notScheduled: false };
 let payDrafts = {};
 let editingPay = {};   // paymentId -> true while its row is in edit mode
 let extraDrafts = {};
@@ -417,14 +438,14 @@ const A = {
       invoiceNo: form.invoiceNo.trim(),
       dealerDeposit: r2(Math.max(0, num(form.dealerDeposit))),
       type, financed: type === "financed", fin: emptyFin(),
-      pourPending: false, scheduled: !form.notScheduled,
+      pourPending: false, scheduled: !form.notScheduled, schedDate: form.schedDate || "",
       extras: [], payments: [], createdAt: today()
     };
     if (type === "inhouse" && num(form.inhouseDeposit) > 0) {
       job.payments.push({ id: uid(), amount: r2(num(form.inhouseDeposit)), date: today(), note: "Deposit" });
     }
     jobs.unshift(job);
-    form = { customer: "", total: "", dealerDeposit: "", inhouseDeposit: "", note: "", invoiceNo: "", type: "inhouse", notScheduled: false };
+    form = { customer: "", total: "", dealerDeposit: "", inhouseDeposit: "", note: "", invoiceNo: "", schedDate: "", type: "inhouse", notScheduled: false };
     showForm = false;
     persist();
   },
@@ -452,7 +473,21 @@ const A = {
   toggleSched(jobId) {
     const j = jobs.find(x => x.id === jobId);
     if (!j) return;
-    j.scheduled = j.scheduled === false ? true : false;
+    if (j.scheduled === false) {
+      const v = prompt("What day is " + j.customer + " scheduled for? (YYYY-MM-DD)", j.schedDate || today());
+      if (v === null) return;
+      j.schedDate = (v || "").trim();
+      j.scheduled = true;
+    } else {
+      j.scheduled = false;
+    }
+    persist();
+  },
+  setSchedDate(jobId, val) {
+    const j = jobs.find(x => x.id === jobId);
+    if (!j) return;
+    j.schedDate = val;
+    if (val) j.scheduled = true;
     persist();
   },
   async refresh() {
@@ -524,11 +559,13 @@ const A = {
       alert("Couldn't read that backup file.");
     }
   },
-  setView(v) { view = v; render(); },
+  setView(v) { view = v; if (v !== "week") weekOff = 0; render(); },
+  shiftWeek(d) { weekOff += d; render(); },
   setPeriod(p) { period = p; offset = 0; render(); },
   shiftPeriod(d) { offset += d; render(); },
   setSearch(v) { search = v; renderList(); },
-  toggle(id) { expanded[id] = expanded[id] === false ? true : false; render(); },
+  toggle(id) { expanded[id] = !expanded[id]; render(); },
+  expandAll(v) { expanded = {}; if (v) for (const j of jobs) expanded[j.id] = true; render(); },
 
   setFinDate(jobId, leg, field, val) {
     const j = jobs.find(x => x.id === jobId);
@@ -536,6 +573,13 @@ const A = {
     j.fin[leg][field] = val;
     store.save(jobs);
     render();
+  },
+  finDeposit(jobId, leg) {
+    const j = jobs.find(x => x.id === jobId);
+    if (!j) return;
+    const f = j.fin[leg];
+    f.deposited = f.deposited ? "" : today();
+    persist();
   },
   finRecord(jobId, leg) {
     const j = jobs.find(x => x.id === jobId);
@@ -547,10 +591,10 @@ const A = {
     if (v === null) return;
     const amount = r2(num(v));
     if (amount <= 0) return;
-    const p = { id: uid(), amount, date: f.received || today(), note: leg === "first" ? "1st invoice (financed)" : "Completion invoice (financed)" };
+    const p = { id: uid(), amount, date: f.deposited || f.received || today(), note: leg === "first" ? "1st invoice (financed)" : "Completion invoice (financed)" };
     j.payments.push(p);
     f.paymentId = p.id;
-    if (!f.received) f.received = p.date;
+    if (!f.deposited) f.deposited = p.date;
     persist();
   },
   async attachImage(jobId, leg, input) {
@@ -692,8 +736,10 @@ function finLegHTML(job, leg, title, hint) {
   if (f.invoiced && !f.received) {
     const d = daysSince(f.invoiced);
     status = `<span class="badge ${d > 21 ? "late" : "wait"}">Waiting ${d} day${d === 1 ? "" : "s"}</span>`;
-  } else if (f.received) {
-    status = `<span class="badge deduct">Received ${pretty(f.received)}</span>`;
+  } else if (f.received && !f.deposited) {
+    status = `<span class="badge fin">✋ Check in hand — not deposited</span>`;
+  } else if (f.deposited) {
+    status = `<span class="badge deduct">Deposited ${pretty(f.deposited)}</span>`;
   }
   let img = "";
   if (f.imgId) {
@@ -712,24 +758,26 @@ function finLegHTML(job, leg, title, hint) {
     <div class="findates">
       <div><label>Invoiced</label>
         <input class="in" type="date" value="${esc(f.invoiced)}" onchange="A.setFinDate('${job.id}','${leg}','invoiced',this.value)"></div>
-      <div><label>Received</label>
+      <div><label>Check received</label>
         <input class="in" type="date" value="${esc(f.received)}" onchange="A.setFinDate('${job.id}','${leg}','received',this.value)"></div>
+      <div><label>Deposited</label>
+        <input class="in" type="date" value="${esc(f.deposited)}" onchange="A.setFinDate('${job.id}','${leg}','deposited',this.value)"></div>
     </div>
     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
       <label class="btn-ghost" style="margin:0;cursor:pointer;font-size:13px;color:#C9C9C9">📷 Check image
         <input type="file" accept="image/*" style="display:none" onchange="A.attachImage('${job.id}','${leg}',this)"></label>
-      ${f.received && !f.paymentId ? `<button class="btn-gold" onclick="A.finRecord('${job.id}','${leg}')">Record in payments</button>` : ""}
+      ${f.received && !f.deposited ? `<button class="btn-gold" onclick="A.finDeposit('${job.id}','${leg}')">Deposited today</button>` : ""}
+      ${f.deposited && !f.paymentId ? `<button class="btn-gold" onclick="A.finRecord('${job.id}','${leg}')">Record in payments</button>` : ""}
       ${f.paymentId ? `<span class="badge deduct">In payments ✓</span>` : ""}
     </div>
     ${img ? `<div style="flex-basis:100%">${img}</div>` : ""}
   </div>`;
 }
-
 function jobCardHTML(job, rng) {
   const charges = chargesOf(job), paid = paidOf(job), bal = balanceOf(job);
   const done = jobDone(job);
   const overpaid = paid > charges + 0.005;
-  const open = expanded[job.id] !== false;
+  const open = expanded[job.id] === true;
   const pd = payDrafts[job.id] || { amount: "", note: "" };
   const xd = extraDrafts[job.id] || { desc: "", amount: "" };
   const flagged = (job.flagNote || "").trim();
@@ -767,9 +815,14 @@ function jobCardHTML(job, rng) {
         onkeydown="if(event.key==='Enter')A.addExtra('${job.id}',1)">
       <button id="addx-${job.id}" class="btn-ghost gold" onclick="A.addExtra('${job.id}',1)" ${!(xd.desc || "").trim() || num(xd.amount) === 0 ? "disabled" : ""}>+ Charge</button>
       <button id="subx-${job.id}" class="btn-ghost" style="color:#9FD0AE;border-color:#2E5A3E" onclick="A.addExtra('${job.id}',-1)" ${!(xd.desc || "").trim() || num(xd.amount) === 0 ? "disabled" : ""}>− Subtract</button>
+      <span style="display:flex;align-items:center;gap:6px">
+        <span class="hint" style="margin:0">Job date:</span>
+        <input class="in" type="date" style="width:150px" value="${esc(job.schedDate || "")}"
+          onchange="A.setSchedDate('${job.id}',this.value)">
+      </span>
       <button class="btn-ghost" style="${job.scheduled === false ? "color:#A8C7F0;border-color:#4A6A9A;font-weight:700" : ""}"
         onclick="A.toggleSched('${job.id}')" title="Customer entered but job not on the schedule yet">
-        ${job.scheduled === false ? "📋 Not scheduled — put on schedule" : "Take off schedule?"}</button>
+        ${job.scheduled === false ? "📋 Put on schedule" : "Take off schedule"}</button>
       <button class="btn-ghost" style="${job.pourPending ? "color:#F5B01C;border-color:#F5B01C;font-weight:700" : ""}"
         onclick="A.togglePour('${job.id}')" title="Prep done but concrete not poured — remaining balance isn't owed yet">
         ${job.pourPending ? "⏳ Pour pending — mark poured" : "Prepped, pour only?"}</button>
@@ -868,6 +921,8 @@ function jobCardHTML(job, rng) {
           ${job.invoiceNo ? `<span class="badge mono" style="color:#A8C7F0;background:#1D2A3F">INV #${esc(job.invoiceNo)}</span>` : ""}
           ${done ? '<span class="badge full">PAID IN FULL</span>' : ""}${finChip}
           ${job.scheduled === false && !done ? '<span class="badge fin">📋 NOT SCHEDULED</span>' : ""}
+          ${job.schedDate && job.scheduled !== false && !done ? `<span class="badge">📅 ${pretty(job.schedDate)}</span>` : ""}
+          ${heldOn(job) > 0 ? `<span class="badge fin">✋ ${fmt(heldOn(job))} held</span>` : ""}
           ${job.pourPending && !done ? '<span class="badge wait">⏳ POUR PENDING</span>' : ""}
           <span id="flag-${job.id}" class="badge flag" style="${flagged ? "" : "display:none"}" title="${esc(job.flagNote)}">⚑ NOTE</span></div>
         <div style="font-size:12px;color:#9FA3A0">${job.type === "dealer" ? "Dealer · " : job.type === "inhouse" ? "In-house · " : ""}Contract ${fmt(job.total)}${ddLine} · Paid ${fmt(paid)}${job.note ? " · " + esc(job.note) : ""}</div>
@@ -890,6 +945,11 @@ function renderList() {
   if (!el) return;
   const rng = periodRange();
   let list = jobs;
+  if (view === "week") {
+    const w = weekRange(weekOff);
+    list = list.filter(j => j.schedDate && inRange(j.schedDate, w) && j.scheduled !== false);
+    list = [...list].sort((a, b) => (a.schedDate < b.schedDate ? -1 : 1));
+  }
   if (view === "active") list = list.filter(j => !jobDone(j));
   if (view === "unscheduled") list = list.filter(j => j.scheduled === false && !jobDone(j));
   if (view === "done") list = list.filter(jobDone);
@@ -903,6 +963,7 @@ function renderList() {
   el.innerHTML = list.length
     ? list.map(j => jobCardHTML(j, rng)).join("")
     : `<div class="empty">${jobs.length === 0 ? "No customers yet. Add one to start tracking."
+        : view === "week" ? "Nothing on the schedule for this week. Set a job date on a customer's card to put them here."
         : rng ? "No activity in this period — no payments received and no jobs added." : "Nothing matches this view."}</div>`;
   loadImagesFor(list);
 }
@@ -947,9 +1008,15 @@ function render() {
   if (SB_READY && !session) { renderLogin(); return; }
   const rng = periodRange();
   let owed = 0, collAll = 0, collPeriod = 0, active = 0, flaggedCount = 0, finCount = 0, pipeline = 0, pourHold = 0, unscheduled = 0;
+  let notSchedOwed = 0, heldTotal = 0, weekCount = 0;
+  const wk = weekRange();
   for (const j of jobs) {
     const b = Math.max(0, balanceOf(j));
-    if (j.pourPending) pourHold += b; else owed += b;
+    heldTotal += heldOn(j);
+    if (j.schedDate && !jobDone(j) && inRange(j.schedDate, wk)) weekCount++;
+    if (j.pourPending) pourHold += b;
+    else if (j.scheduled === false) notSchedOwed += b;
+    else owed += b;
     collAll += paidOf(j);
     if (rng) for (const p of j.payments) if (inRange(p.date, rng)) collPeriod += p.amount;
     if (!jobDone(j)) active++;
@@ -964,6 +1031,7 @@ function render() {
     }
   }
   owed = r2(owed); collAll = r2(collAll); collPeriod = r2(collPeriod); pipeline = r2(pipeline); pourHold = r2(pourHold);
+  notSchedOwed = r2(notSchedOwed); heldTotal = r2(heldTotal);
   const doneCount = jobs.length - active;
 
   document.getElementById("app").innerHTML = `
@@ -1040,14 +1108,19 @@ function render() {
 
     <div class="summary">
       <div class="sumcard" style="border-top:3px solid #F5B01C">
-        <div class="eyebrow">Still owed to you</div>
+        <div class="eyebrow">Owed — scheduled work</div>
         <div class="big mono gold">${fmt(owed)}</div>
-        <div style="font-size:12px;color:#9FA3A0;margin-top:2px">${active} active job${active === 1 ? "" : "s"} — all time${pourHold > 0 ? ` · <span style="color:#F5B01C">⏳ ${fmt(pourHold)} pending pour (not counted)</span>` : ""}</div>
+        <div style="font-size:12px;color:#9FA3A0;margin-top:2px">${active} active job${active === 1 ? "" : "s"}${pourHold > 0 ? ` · ⏳ ${fmt(pourHold)} pending pour` : ""}</div>
       </div>
       <div class="sumcard" style="border-top:3px solid #4A6A9A">
-        <div class="eyebrow">Invoiced — waiting</div>
-        <div class="big mono" style="color:#A8C7F0">${fmt(pipeline)}</div>
-        <div style="font-size:12px;color:#9FA3A0;margin-top:2px">financing invoices out</div>
+        <div class="eyebrow">✋ Checks in hand</div>
+        <div class="big mono" style="color:#A8C7F0">${fmt(heldTotal)}</div>
+        <div style="font-size:12px;color:#9FA3A0;margin-top:2px">received, not deposited yet</div>
+      </div>
+      <div class="sumcard" style="border-top:3px solid #6E6E6E">
+        <div class="eyebrow">Not scheduled yet</div>
+        <div class="big mono" style="color:#9FA3A0">${fmt(notSchedOwed)}</div>
+        <div style="font-size:12px;color:#9FA3A0;margin-top:2px">${unscheduled} waiting to schedule</div>
       </div>
       <div class="sumcard" style="border-top:3px solid #4A4A4A">
         <div class="eyebrow">Collected${rng ? " — " + rng.label : ""}</div>
@@ -1057,6 +1130,7 @@ function render() {
     </div>
 
     <div class="filters">
+      <button class="tab ${view === "week" ? "on" : ""}" onclick="A.setView('week')">📅 This week (${weekCount})</button>
       <button class="tab ${view === "active" ? "on" : ""}" onclick="A.setView('active')">Active (${active})</button>
       <button class="tab ${view === "unscheduled" ? "on" : ""}" onclick="A.setView('unscheduled')">📋 Waiting to schedule (${unscheduled})</button>
       <button class="tab ${view === "financed" ? "on" : ""}" onclick="A.setView('financed')">Financed (${finCount})</button>
@@ -1065,7 +1139,15 @@ function render() {
       <button class="tab ${view === "all" ? "on" : ""}" onclick="A.setView('all')">All</button>
       <input class="in" style="width:auto;flex:1 1 160px;min-width:140px" placeholder="Search name, invoice #, notes…" value="${esc(search)}"
         oninput="A.setSearch(this.value)">
+      <button class="tab sm" onclick="A.expandAll(true)" title="Open every card">Expand all</button>
+      <button class="tab sm" onclick="A.expandAll(false)" title="Close every card">Collapse all</button>
     </div>
+    ${view === "week" ? `<div class="periodbar" style="margin:-2px 0 12px">
+      <button class="pnav" onclick="A.shiftWeek(-1)">◀ Prev week</button>
+      <span class="plabel">${weekRange(weekOff).label}${weekOff === 0 ? " · this week" : ""}</span>
+      <button class="pnav" onclick="A.shiftWeek(1)">Next week ▶</button>
+      ${weekOff !== 0 ? `<button class="pnav" onclick="A.shiftWeek(${-weekOff})">Today</button>` : ""}
+    </div>` : ""}
     <div id="list"></div>
     <div style="display:flex;gap:10px;align-items:center;margin-top:24px;padding-top:14px;border-top:1px solid #2A2A2A;flex-wrap:wrap">
       <span class="hint" style="margin:0">Backup:</span>
